@@ -103,91 +103,31 @@ file = st.file_uploader("Upload CSV")
 if file:
     df = pd.read_csv(file)
 
-# ================= AUTO DETECT FILTERS =================
-st.sidebar.header("🔎 Filters")
+    # ================= FILTERS (CLEAN DROPDOWN) =================
+    st.sidebar.header("🔎 Filters")
 
-filtered_df = df.copy()
+    filtered_df = df.copy()
 
-# loop through ALL columns dynamically
-for col in df.columns:
+    for col in df.columns:
+        values = df[col].dropna().astype(str).unique().tolist()
 
-    # convert everything to string for consistent filtering
-    unique_values = df[col].dropna().astype(str).unique().tolist()
+        try:
+            values = sorted(values)
+        except:
+            pass
 
-    # sort values (safe)
-    try:
-        unique_values = sorted(unique_values)
-    except:
-        pass
+        selected = st.sidebar.multiselect(
+            col,
+            values,
+            default=values
+        )
 
-    # dropdown filter
-    selected_values = st.sidebar.multiselect(
-        label=f"{col}",
-        options=unique_values,
-        default=unique_values
-    )
-
-    # apply filtering
-    if selected_values:
-        filtered_df = filtered_df[
-            filtered_df[col].astype(str).isin(selected_values)
-        ]
-        # ---------- CATEGORICAL ----------
-        if df[col].dtype == "object" or df[col].dtype.name == "category":
-            options = sorted(df[col].dropna().unique())
-
-            selected = st.sidebar.multiselect(
-                f"Select {col}",
-                options,
-                default=options
-            )
-
-            filtered_df = filtered_df[filtered_df[col].isin(selected)]
-
-        # ---------- NUMERIC ----------
-        elif pd.api.types.is_numeric_dtype(df[col]):
-
-            min_val = float(df[col].min())
-            max_val = float(df[col].max())
-
-            selected_range = st.sidebar.slider(
-                f"{col} range",
-                min_val,
-                max_val,
-                (min_val, max_val)
-            )
-
+        if selected:
             filtered_df = filtered_df[
-                (filtered_df[col] >= selected_range[0]) &
-                (filtered_df[col] <= selected_range[1])
+                filtered_df[col].astype(str).isin(selected)
             ]
 
-        # ---------- DATE ----------
-        elif pd.api.types.is_datetime64_any_dtype(df[col]):
-
-            min_date = df[col].min()
-            max_date = df[col].max()
-
-            selected_date = st.sidebar.date_input(
-                f"{col} range",
-                [min_date, max_date]
-            )
-
-            if len(selected_date) == 2:
-                filtered_df = filtered_df[
-                    (filtered_df[col] >= pd.to_datetime(selected_date[0])) &
-                    (filtered_df[col] <= pd.to_datetime(selected_date[1]))
-                ]
-
-        # ---------- FALLBACK ----------
-        else:
-            text_val = st.sidebar.text_input(f"Search in {col}")
-
-            if text_val:
-                filtered_df = filtered_df[
-                    filtered_df[col].astype(str).str.contains(text_val, case=False)
-                ]
-
+    # ================= DATABASE =================
     engine = create_engine("sqlite:///:memory:")
     filtered_df.to_sql("data", engine, index=False)
 
@@ -219,7 +159,7 @@ for col in df.columns:
             result = filtered_df.head(10)
             success = False
 
-        # metrics
+        # metrics update
         st.session_state.metrics["q"] += 1
         if success:
             st.session_state.metrics["success"] += 1
@@ -245,27 +185,27 @@ for col in df.columns:
             if len(num_cols) > 0:
                 col = num_cols[0]
 
-                total = result[col].sum()
-                avg = result[col].mean()
-                mx = result[col].max()
-                mn = result[col].min()
-                cnt = result[col].count()
-
                 c1,c2,c3,c4,c5 = st.columns(5)
-                c1.metric("SUM", f"{total:.2f}")
-                c2.metric("AVG", f"{avg:.2f}")
-                c3.metric("MAX", f"{mx:.2f}")
-                c4.metric("MIN", f"{mn:.2f}")
-                c5.metric("COUNT", cnt)
+                c1.metric("SUM", result[col].sum())
+                c2.metric("AVG", result[col].mean())
+                c3.metric("MAX", result[col].max())
+                c4.metric("MIN", result[col].min())
+                c5.metric("COUNT", result[col].count())
 
                 st.dataframe(pd.DataFrame({
                     "Metric":["SUM","AVG","MAX","MIN","COUNT"],
-                    "Value":[total,avg,mx,mn,cnt]
+                    "Value":[
+                        result[col].sum(),
+                        result[col].mean(),
+                        result[col].max(),
+                        result[col].min(),
+                        result[col].count()
+                    ]
                 }), use_container_width=True)
 
         # ================= DEFAULT CHART =================
-        if len(result.columns)>=2:
-            x,y = result.columns[:2]
+        if len(result.columns) >= 2:
+            x, y = result.columns[:2]
             st.bar_chart(result.set_index(x)[y])
 
         # ================= BUILDER =================
@@ -284,21 +224,13 @@ for col in df.columns:
                 })
 
         for i, w in enumerate(st.session_state.widgets):
-
-            chart_type = w.get("type")
-            x_col = w.get("x")
-            y_col = w.get("y")
-
-            if x_col not in result.columns or y_col not in result.columns:
-                continue
-
             try:
-                if chart_type == "Bar":
-                    st.bar_chart(result.set_index(x_col)[y_col])
-                elif chart_type == "Line":
-                    st.line_chart(result.set_index(x_col)[y_col])
-                elif chart_type == "Scatter":
-                    st.scatter_chart(result[[x_col, y_col]])
+                if w["type"] == "Bar":
+                    st.bar_chart(result.set_index(w["x"])[w["y"]])
+                elif w["type"] == "Line":
+                    st.line_chart(result.set_index(w["x"])[w["y"]])
+                elif w["type"] == "Scatter":
+                    st.scatter_chart(result[[w["x"], w["y"]]])
             except:
                 pass
 
