@@ -31,7 +31,7 @@ def save_dashboards(data):
     with open(DASHBOARD_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-# ========================= COLUMN MATCH =========================
+# ========================= SQL HELPERS =========================
 def map_columns(query, df_cols):
     query = query.lower()
     detected = []
@@ -42,10 +42,8 @@ def map_columns(query, df_cols):
             detected.append(col)
     return list(set(detected))
 
-# ========================= AGGREGATION =========================
 def detect_aggregation(query, df):
     q = query.lower()
-
     agg_map = {
         "sum":"SUM","total":"SUM",
         "avg":"AVG","average":"AVG",
@@ -54,49 +52,29 @@ def detect_aggregation(query, df):
         "min":"MIN","minimum":"MIN"
     }
 
-    agg_func = None
-    for k in agg_map:
-        if k in q:
-            agg_func = agg_map[k]
+    agg_func = next((agg_map[k] for k in agg_map if k in q), None)
 
-    value_col = None
-    for col in df.columns:
-        if df[col].dtype != "object" and col.lower() in q:
-            value_col = col
-
-    group_col = None
-    for col in df.columns:
-        if f"by {col.lower()}" in q:
-            group_col = col
+    value_col = next((col for col in df.columns if df[col].dtype != "object" and col.lower() in q), None)
+    group_col = next((col for col in df.columns if f"by {col.lower()}" in q), None)
 
     return agg_func, value_col, group_col
 
-# ========================= SQL =========================
 def generate_sql(query, df):
-
     agg, val, grp = detect_aggregation(query, df)
-
-    limit = None
-    m = re.search(r"\d+", query)
-    if m:
-        limit = int(m.group())
 
     if agg and val:
         if grp:
-            sql = f"SELECT `{grp}`, {agg}(`{val}`) FROM data GROUP BY `{grp}`"
-            if limit:
-                sql += f" LIMIT {limit}"
-            return sql
+            return f"SELECT `{grp}`, {agg}(`{val}`) FROM data GROUP BY `{grp}`"
         return f"SELECT {agg}(`{val}`) FROM data"
 
     cols = map_columns(query, df.columns.tolist())
     if cols:
-        return f"SELECT {', '.join(cols)} FROM data LIMIT {limit or 10}"
+        return f"SELECT {', '.join(cols)} FROM data LIMIT 10"
 
     return "SELECT * FROM data LIMIT 10"
 
 # ========================= UI =========================
-st.title("🚀 Natural Language Data Analysis System")
+st.title("🚀 AI Data Analysis System")
 
 file = st.file_uploader("Upload CSV")
 
@@ -108,44 +86,33 @@ if file:
     filtered_df = df.copy()
 
     for col in df.columns:
-        values = df[col].dropna().astype(str).unique().tolist()
-
-        try:
-            values = sorted(values)
-        except:
-            pass
-
+        values = sorted(df[col].dropna().astype(str).unique())
         selected = st.sidebar.multiselect(col, values, default=values)
 
         if selected:
-            filtered_df = filtered_df[
-                filtered_df[col].astype(str).isin(selected)
-            ]
+            filtered_df = filtered_df[filtered_df[col].astype(str).isin(selected)]
 
-    # ================= DATABASE =================
     engine = create_engine("sqlite:///:memory:")
     filtered_df.to_sql("data", engine, index=False)
 
     # ================= DATA =================
     st.subheader("📂 Data Preview")
-    st.dataframe(filtered_df, use_container_width=True)
+    st.dataframe(filtered_df)
 
     # ================= KPI =================
     m = st.session_state.metrics
-    k1,k2,k3,k4 = st.columns(4)
-
-    k1.metric("Queries", m["q"])
-    k2.metric("Success %", (m["success"]/m["q"]*100) if m["q"] else 0)
-    k3.metric("Failures", m["fail"])
-    k4.metric("Avg Time", (m["time"]/m["q"]) if m["q"] else 0)
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Queries", m["q"])
+    c2.metric("Success %", (m["success"]/m["q"]*100) if m["q"] else 0)
+    c3.metric("Failures", m["fail"])
+    c4.metric("Avg Time", (m["time"]/m["q"]) if m["q"] else 0)
 
     # ================= QUERY =================
     query = st.text_input("Ask your question")
 
     if query:
         start = time.time()
-
-        sql = generate_sql(query.lower(), filtered_df)
+        sql = generate_sql(query, filtered_df)
 
         try:
             result = pd.read_sql(sql, engine)
@@ -154,88 +121,34 @@ if file:
             result = filtered_df.head(10)
             success = False
 
-        # metrics update
+        # update metrics
         st.session_state.metrics["q"] += 1
-        if success:
-            st.session_state.metrics["success"] += 1
-        else:
-            st.session_state.metrics["fail"] += 1
-
+        st.session_state.metrics["success"] += int(success)
+        st.session_state.metrics["fail"] += int(not success)
         st.session_state.metrics["time"] += (time.time()-start)
 
-        # ================= SQL =================
-        st.subheader("🧾 SQL")
-        st.code(sql, language="sql")
-
-        # ================= RESULT =================
-        st.subheader("📊 Result")
-        st.dataframe(result, use_container_width=True)
+        st.code(sql)
+        st.dataframe(result)
 
         # ================= EXPORT =================
-        st.subheader("📤 Export Result")
+        st.subheader("📤 Export")
 
-        export_format = st.selectbox("Choose format", ["CSV", "Excel", "PDF", "Word"])
+        format_type = st.selectbox("Format", ["CSV","Excel"])
 
-        def convert_data(df, fmt):
-            if fmt == "CSV":
-                return df.to_csv(index=False).encode("utf-8")
+        if format_type == "CSV":
+            st.download_button("Download CSV", result.to_csv(index=False), "data.csv")
 
-            elif fmt == "Excel":
-                from io import BytesIO
-                buffer = BytesIO()
-                df.to_excel(buffer, index=False)
-                return buffer.getvalue()
-
-            elif fmt == "PDF":
-                from reportlab.platypus import SimpleDocTemplate, Table
-                from io import BytesIO
-
-                buffer = BytesIO()
-                doc = SimpleDocTemplate(buffer)
-
-                data = [df.columns.tolist()] + df.values.tolist()
-                table = Table(data)
-
-                doc.build([table])
-                return buffer.getvalue()
-
-            elif fmt == "Word":
-                from docx import Document
-                from io import BytesIO
-
-                buffer = BytesIO()
-                doc = Document()
-
-                table = doc.add_table(rows=len(df)+1, cols=len(df.columns))
-
-                for i, col in enumerate(df.columns):
-                    table.rows[0].cells[i].text = col
-
-                for i, row in df.iterrows():
-                    for j, val in enumerate(row):
-                        table.rows[i+1].cells[j].text = str(val)
-
-                doc.save(buffer)
-                return buffer.getvalue()
-
-        file_data = convert_data(result, export_format)
-
-        st.download_button(
-            label="⬇ Download",
-            data=file_data,
-            file_name=f"result.{export_format.lower()}",
-            mime="application/octet-stream"
-        )
+        if format_type == "Excel":
+            from io import BytesIO
+            buf = BytesIO()
+            result.to_excel(buf, index=False)
+            st.download_button("Download Excel", buf.getvalue(), "data.xlsx")
 
         # ================= INSIGHTS =================
-        st.subheader("📊 Insights")
-
         if not result.empty:
             num_cols = result.select_dtypes(include=['number']).columns
-
-            if len(num_cols) > 0:
+            if len(num_cols):
                 col = num_cols[0]
-
                 c1,c2,c3,c4,c5 = st.columns(5)
                 c1.metric("SUM", result[col].sum())
                 c2.metric("AVG", result[col].mean())
@@ -243,18 +156,54 @@ if file:
                 c4.metric("MIN", result[col].min())
                 c5.metric("COUNT", result[col].count())
 
-                st.dataframe(pd.DataFrame({
-                    "Metric":["SUM","AVG","MAX","MIN","COUNT"],
-                    "Value":[
-                        result[col].sum(),
-                        result[col].mean(),
-                        result[col].max(),
-                        result[col].min(),
-                        result[col].count()
-                    ]
-                }), use_container_width=True)
-
         # ================= CHART =================
-        if len(result.columns) >= 2:
-            x, y = result.columns[:2]
+        if len(result.columns)>=2:
+            x,y = result.columns[:2]
             st.bar_chart(result.set_index(x)[y])
+
+        # ================= BUILDER =================
+        st.subheader("🧩 Dashboard Builder")
+
+        with st.expander("Add Chart"):
+            chart_type = st.selectbox("Type", ["Bar","Line","Scatter"])
+            x = st.selectbox("X Axis", result.columns)
+            y = st.selectbox("Y Axis", result.columns)
+
+            if st.button("Add Chart"):
+                st.session_state.widgets.append({
+                    "type": chart_type,
+                    "x": x,
+                    "y": y
+                })
+
+        for i,w in enumerate(st.session_state.widgets):
+            try:
+                if w["type"]=="Bar":
+                    st.bar_chart(result.set_index(w["x"])[w["y"]])
+                elif w["type"]=="Line":
+                    st.line_chart(result.set_index(w["x"])[w["y"]])
+                elif w["type"]=="Scatter":
+                    st.scatter_chart(result[[w["x"],w["y"]]])
+            except:
+                pass
+
+            if st.button(f"Remove {i}", key=i):
+                st.session_state.widgets.pop(i)
+                st.rerun()
+
+        # ================= SAVE =================
+        st.subheader("💾 Save / Load Report")
+
+        name = st.text_input("Report Name")
+
+        if st.button("Save"):
+            db = load_dashboards()
+            db[name] = st.session_state.widgets
+            save_dashboards(db)
+            st.success("Saved")
+
+        db = load_dashboards()
+        if db:
+            sel = st.selectbox("Load", list(db.keys()))
+            if st.button("Load"):
+                st.session_state.widgets = db[sel]
