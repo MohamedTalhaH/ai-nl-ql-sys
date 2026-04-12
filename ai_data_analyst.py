@@ -103,9 +103,8 @@ file = st.file_uploader("Upload CSV")
 if file:
     df = pd.read_csv(file)
 
-    # ================= FILTERS (CLEAN DROPDOWN) =================
+    # ================= FILTERS =================
     st.sidebar.header("🔎 Filters")
-
     filtered_df = df.copy()
 
     for col in df.columns:
@@ -116,11 +115,7 @@ if file:
         except:
             pass
 
-        selected = st.sidebar.multiselect(
-            col,
-            values,
-            default=values
-        )
+        selected = st.sidebar.multiselect(col, values, default=values)
 
         if selected:
             filtered_df = filtered_df[
@@ -176,6 +171,62 @@ if file:
         st.subheader("📊 Result")
         st.dataframe(result, use_container_width=True)
 
+        # ================= EXPORT =================
+        st.subheader("📤 Export Result")
+
+        export_format = st.selectbox("Choose format", ["CSV", "Excel", "PDF", "Word"])
+
+        def convert_data(df, fmt):
+            if fmt == "CSV":
+                return df.to_csv(index=False).encode("utf-8")
+
+            elif fmt == "Excel":
+                from io import BytesIO
+                buffer = BytesIO()
+                df.to_excel(buffer, index=False)
+                return buffer.getvalue()
+
+            elif fmt == "PDF":
+                from reportlab.platypus import SimpleDocTemplate, Table
+                from io import BytesIO
+
+                buffer = BytesIO()
+                doc = SimpleDocTemplate(buffer)
+
+                data = [df.columns.tolist()] + df.values.tolist()
+                table = Table(data)
+
+                doc.build([table])
+                return buffer.getvalue()
+
+            elif fmt == "Word":
+                from docx import Document
+                from io import BytesIO
+
+                buffer = BytesIO()
+                doc = Document()
+
+                table = doc.add_table(rows=len(df)+1, cols=len(df.columns))
+
+                for i, col in enumerate(df.columns):
+                    table.rows[0].cells[i].text = col
+
+                for i, row in df.iterrows():
+                    for j, val in enumerate(row):
+                        table.rows[i+1].cells[j].text = str(val)
+
+                doc.save(buffer)
+                return buffer.getvalue()
+
+        file_data = convert_data(result, export_format)
+
+        st.download_button(
+            label="⬇ Download",
+            data=file_data,
+            file_name=f"result.{export_format.lower()}",
+            mime="application/octet-stream"
+        )
+
         # ================= INSIGHTS =================
         st.subheader("📊 Insights")
 
@@ -203,55 +254,7 @@ if file:
                     ]
                 }), use_container_width=True)
 
-        # ================= DEFAULT CHART =================
+        # ================= CHART =================
         if len(result.columns) >= 2:
             x, y = result.columns[:2]
             st.bar_chart(result.set_index(x)[y])
-
-        # ================= BUILDER =================
-        st.subheader("🧩 Dashboard Builder")
-
-        with st.expander("Add Chart"):
-            t = st.selectbox("Type", ["Bar","Line","Scatter"])
-            x = st.selectbox("X", result.columns)
-            y = st.selectbox("Y", result.columns)
-
-            if st.button("Add Chart"):
-                st.session_state.widgets.append({
-                    "type": t,
-                    "x": x,
-                    "y": y
-                })
-
-        for i, w in enumerate(st.session_state.widgets):
-            try:
-                if w["type"] == "Bar":
-                    st.bar_chart(result.set_index(w["x"])[w["y"]])
-                elif w["type"] == "Line":
-                    st.line_chart(result.set_index(w["x"])[w["y"]])
-                elif w["type"] == "Scatter":
-                    st.scatter_chart(result[[w["x"], w["y"]]])
-            except:
-                pass
-
-            if st.button(f"Remove {i}", key=f"remove_{i}"):
-                st.session_state.widgets.pop(i)
-                st.rerun()
-
-        # ================= SAVE =================
-        st.subheader("💾 Save Report")
-
-        name = st.text_input("Report Name")
-
-        if st.button("Save Report"):
-            db = load_dashboards()
-            db[name] = st.session_state.widgets
-            save_dashboards(db)
-            st.success("Saved!")
-
-        db = load_dashboards()
-
-        if db:
-            sel = st.selectbox("Load Report", list(db.keys()))
-            if st.button("Load"):
-                st.session_state.widgets = db[sel]
