@@ -103,15 +103,41 @@ file = st.file_uploader("Upload CSV")
 if file:
     df = pd.read_csv(file)
 
-    # ================= FILTERS =================
-    st.sidebar.header("Filters")
+    # ================= FILTERS (FIXED) =================
+    st.sidebar.header("🔎 Filters")
     filtered_df = df.copy()
 
     for col in df.columns:
-        if df[col].dtype == "object":
-            val = st.sidebar.multiselect(col, df[col].unique())
-            if val:
-                filtered_df = filtered_df[filtered_df[col].isin(val)]
+
+        # CATEGORICAL FILTER
+        if df[col].dtype == "object" or df[col].dtype.name == "category":
+            options = df[col].dropna().unique()
+
+            selected = st.sidebar.multiselect(
+                f"{col}",
+                options
+            )
+
+            if selected:
+                filtered_df = filtered_df[filtered_df[col].isin(selected)]
+
+        # NUMERIC FILTER
+        elif pd.api.types.is_numeric_dtype(df[col]):
+
+            min_val = float(df[col].min())
+            max_val = float(df[col].max())
+
+            selected_range = st.sidebar.slider(
+                f"{col} range",
+                min_val,
+                max_val,
+                (min_val, max_val)
+            )
+
+            filtered_df = filtered_df[
+                (df[col] >= selected_range[0]) &
+                (df[col] <= selected_range[1])
+            ]
 
     engine = create_engine("sqlite:///:memory:")
     filtered_df.to_sql("data", engine, index=False)
