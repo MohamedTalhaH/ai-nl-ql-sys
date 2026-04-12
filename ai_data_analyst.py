@@ -3,8 +3,6 @@ import streamlit as st
 import pandas as pd
 import re
 import time
-import asyncio
-import aiohttp
 import json
 import os
 from sqlalchemy import create_engine
@@ -13,8 +11,6 @@ from difflib import get_close_matches
 st.set_page_config(layout="wide")
 
 # ========================= CONFIG =========================
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "llama3"
 DASHBOARD_FILE = "dashboards.json"
 
 # ========================= STATE =========================
@@ -75,17 +71,8 @@ def detect_aggregation(query, df):
 
     return agg_func, value_col, group_col
 
-# ========================= LLM =========================
-async def call_llm(prompt):
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(OLLAMA_URL, json={"model":MODEL,"prompt":prompt}) as r:
-                return (await r.json()).get("response","")
-    except:
-        return None
-
 # ========================= SQL =========================
-async def generate_sql(query, df):
+def generate_sql(query, df):
 
     agg, val, grp = detect_aggregation(query, df)
 
@@ -106,11 +93,10 @@ async def generate_sql(query, df):
     if cols:
         return f"SELECT {', '.join(cols)} FROM data LIMIT {limit or 10}"
 
-    raw = await call_llm(f"Table: data Columns: {df.columns.tolist()} Query: {query} SQL:")
-    return raw if raw and "SELECT" in raw.upper() else "SELECT * FROM data LIMIT 10"
+    return "SELECT * FROM data LIMIT 10"
 
 # ========================= UI =========================
-st.title("🚀Natural language based analysis system using AI")
+st.title("🚀 Natural Language Data Analysis System")
 
 file = st.file_uploader("Upload CSV")
 
@@ -149,7 +135,7 @@ if file:
     if query:
         start = time.time()
 
-        sql = asyncio.run(generate_sql(query.lower(), filtered_df))
+        sql = generate_sql(query.lower(), filtered_df)
 
         try:
             result = pd.read_sql(sql, engine)
@@ -202,7 +188,7 @@ if file:
                     "Value":[total,avg,mx,mn,cnt]
                 }), use_container_width=True)
 
-        # ================= CHART =================
+        # ================= DEFAULT CHART =================
         if len(result.columns)>=2:
             x,y = result.columns[:2]
             st.bar_chart(result.set_index(x)[y])
@@ -222,15 +208,14 @@ if file:
                     "y": y
                 })
 
-        # ===== SAFE RENDER =====
+        # SAFE RENDER
         for i, w in enumerate(st.session_state.widgets):
 
-            chart_type = w.get("type") or w.get("t")
+            chart_type = w.get("type")
             x_col = w.get("x")
             y_col = w.get("y")
 
-            if not chart_type or x_col not in result.columns or y_col not in result.columns:
-                st.warning("Invalid widget config")
+            if x_col not in result.columns or y_col not in result.columns:
                 continue
 
             try:
@@ -240,8 +225,8 @@ if file:
                     st.line_chart(result.set_index(x_col)[y_col])
                 elif chart_type == "Scatter":
                     st.scatter_chart(result[[x_col, y_col]])
-            except Exception as e:
-                st.warning(f"Chart error: {e}")
+            except:
+                pass
 
             if st.button(f"Remove {i}", key=f"remove_{i}"):
                 st.session_state.widgets.pop(i)
