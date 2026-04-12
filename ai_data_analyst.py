@@ -103,14 +103,28 @@ file = st.file_uploader("Upload CSV")
 if file:
     df = pd.read_csv(file)
 
-    # ================= FILTERS (ALL COLUMNS) =================
-    st.sidebar.header("🔎 Filters")
+# ================= FILTERS (DROPDOWN STYLE) =================
+st.sidebar.header("🔎 Filters")
 
-    filtered_df = df.copy()
+filtered_df = df.copy()
 
-    for col in df.columns:
+for col in df.columns:
 
-        st.sidebar.markdown(f"### {col}")
+    # get unique values
+    options = df[col].dropna().astype(str).unique().tolist()
+    options = sorted(options)
+
+    selected = st.sidebar.multiselect(
+        f"{col}",
+        options,
+        default=options
+    )
+
+    # apply filter
+    if selected:
+        filtered_df = filtered_df[
+            filtered_df[col].astype(str).isin(selected)
+        ]
 
         # ---------- CATEGORICAL ----------
         if df[col].dtype == "object" or df[col].dtype.name == "category":
