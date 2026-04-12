@@ -103,25 +103,28 @@ file = st.file_uploader("Upload CSV")
 if file:
     df = pd.read_csv(file)
 
-    # ================= FILTERS (FIXED) =================
+    # ================= FILTERS (ALL COLUMNS) =================
     st.sidebar.header("🔎 Filters")
+
     filtered_df = df.copy()
 
     for col in df.columns:
 
-        # CATEGORICAL FILTER
+        st.sidebar.markdown(f"### {col}")
+
+        # ---------- CATEGORICAL ----------
         if df[col].dtype == "object" or df[col].dtype.name == "category":
-            options = df[col].dropna().unique()
+            options = sorted(df[col].dropna().unique())
 
             selected = st.sidebar.multiselect(
-                f"{col}",
-                options
+                f"Select {col}",
+                options,
+                default=options
             )
 
-            if selected:
-                filtered_df = filtered_df[filtered_df[col].isin(selected)]
+            filtered_df = filtered_df[filtered_df[col].isin(selected)]
 
-        # NUMERIC FILTER
+        # ---------- NUMERIC ----------
         elif pd.api.types.is_numeric_dtype(df[col]):
 
             min_val = float(df[col].min())
@@ -135,9 +138,35 @@ if file:
             )
 
             filtered_df = filtered_df[
-                (df[col] >= selected_range[0]) &
-                (df[col] <= selected_range[1])
+                (filtered_df[col] >= selected_range[0]) &
+                (filtered_df[col] <= selected_range[1])
             ]
+
+        # ---------- DATE ----------
+        elif pd.api.types.is_datetime64_any_dtype(df[col]):
+
+            min_date = df[col].min()
+            max_date = df[col].max()
+
+            selected_date = st.sidebar.date_input(
+                f"{col} range",
+                [min_date, max_date]
+            )
+
+            if len(selected_date) == 2:
+                filtered_df = filtered_df[
+                    (filtered_df[col] >= pd.to_datetime(selected_date[0])) &
+                    (filtered_df[col] <= pd.to_datetime(selected_date[1]))
+                ]
+
+        # ---------- FALLBACK ----------
+        else:
+            text_val = st.sidebar.text_input(f"Search in {col}")
+
+            if text_val:
+                filtered_df = filtered_df[
+                    filtered_df[col].astype(str).str.contains(text_val, case=False)
+                ]
 
     engine = create_engine("sqlite:///:memory:")
     filtered_df.to_sql("data", engine, index=False)
@@ -234,7 +263,6 @@ if file:
                     "y": y
                 })
 
-        # SAFE RENDER
         for i, w in enumerate(st.session_state.widgets):
 
             chart_type = w.get("type")
