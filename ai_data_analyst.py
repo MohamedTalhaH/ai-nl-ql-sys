@@ -11,6 +11,13 @@ from io import BytesIO
 from reportlab.platypus import SimpleDocTemplate, Table
 from docx import Document
 
+# GROQ (SAFE IMPORT)
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except:
+    GROQ_AVAILABLE = False
+
 st.set_page_config(layout="wide")
 
 # ========================= CONFIG =========================
@@ -23,16 +30,43 @@ if "metrics" not in st.session_state:
 if "widgets" not in st.session_state:
     st.session_state.widgets = []
 
-# ========================= STORAGE =========================
-def load_dashboards():
-    if not os.path.exists(DASHBOARD_FILE):
-        return {}
-    return json.load(open(DASHBOARD_FILE))
+# ========================= GROQ =========================
+def groq_sql(query, df):
+    if not GROQ_AVAILABLE:
+        return None
 
-def save_dashboards(data):
-    json.dump(data, open(DASHBOARD_FILE,"w"), indent=2)
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return None
 
-# ========================= NLP SQL =========================
+    try:
+        client = Groq(api_key=api_key)
+
+        schema = ", ".join(df.columns)
+
+        prompt = f"""
+        Convert this to SQL query.
+        Table name: data
+        Columns: {schema}
+        Only return SQL.
+
+        Query: {query}
+        """
+
+        res = client.chat.completions.create(
+            model="llama3-70b-8192",
+            messages=[{"role":"user","content":prompt}]
+        )
+
+        text = res.choices[0].message.content
+
+        match = re.search(r"(SELECT.*)", text, re.IGNORECASE)
+        return match.group(1) if match else None
+
+    except:
+        return None
+
+# ========================= RULE ENGINE =========================
 def map_columns(query, cols):
     query = query.lower()
     detected = []
@@ -57,7 +91,7 @@ def detect_agg(query, df):
 
     return agg, val, grp
 
-def generate_sql(query, df):
+def rule_sql(query, df):
     agg,val,grp = detect_agg(query, df)
 
     if agg and val:
@@ -71,6 +105,33 @@ def generate_sql(query, df):
 
     return "SELECT * FROM data LIMIT 10"
 
+# ========================= HYBRID =========================
+def generate_sql(query, df):
+    start = time.time()
+
+    sql = groq_sql(query, df)
+    method = "Groq AI"
+
+    if not sql:
+        sql = rule_sql(query, df)
+        method = "Rule Engine"
+
+    elapsed = time.time() - start
+
+    st.session_state.metrics["q"] += 1
+    st.session_state.metrics["time"] += elapsed
+
+    return sql, method, elapsed
+
+# ========================= STORAGE =========================
+def load_dashboards():
+    if not os.path.exists(DASHBOARD_FILE):
+        return {}
+    return json.load(open(DASHBOARD_FILE))
+
+def save_dashboards(data):
+    json.dump(data, open(DASHBOARD_FILE,"w"), indent=2)
+
 # ========================= UI =========================
 st.title("🚀 AI Data Analysis Dashboard")
 
@@ -79,7 +140,7 @@ file = st.file_uploader("Upload CSV")
 if file:
     df = pd.read_csv(file)
 
-    # ================= FILTERS =================
+    # ================= FILTER =================
     st.sidebar.header("Filters")
     filtered_df = df.copy()
 
@@ -96,40 +157,27 @@ if file:
     m = st.session_state.metrics
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Queries", m["q"])
-    c2.metric("Success %", (m["success"]/m["q"]*100) if m["q"] else 0)
-    c3.metric("Failures", m["fail"])
-    c4.metric("Avg Time", (m["time"]/m["q"]) if m["q"] else 0)
-
-    # ================= DATA =================
-    st.subheader("Data Preview")
-    st.dataframe(filtered_df)
+    c2.metric("Avg Time", (m["time"]/m["q"]) if m["q"] else 0)
+    c3.metric("Success", m["q"])
+    c4.metric("AI Enabled", "Yes" if GROQ_AVAILABLE else "No")
 
     # ================= QUERY =================
     query = st.text_input("Ask your query")
 
     if query:
-        start = time.time()
-        sql = generate_sql(query, filtered_df)
+        sql,method,elapsed = generate_sql(query, filtered_df)
 
-        # metrics
-        st.session_state.metrics["q"] += 1
+        st.success(f"{method} | {elapsed:.2f}s")
 
-        try:
-            result = pd.read_sql(sql, engine)
-            st.session_state.metrics["success"] += 1
-        except:
-            result = filtered_df.head(10)
-            st.session_state.metrics["fail"] += 1
-
-        st.session_state.metrics["time"] += (time.time()-start)
-
-        # SQL display
         st.subheader("Generated SQL")
         st.code(sql, language="sql")
 
-        # result
-        st.subheader("Result")
-        st.dataframe(result)
+        try:
+            result = pd.read_sql(sql, engine)
+            st.dataframe(result)
+        except:
+            result = filtered_df.head(10)
+            st.error("SQL failed, showing fallback data")
 
         # ================= EXPORT =================
         st.subheader("Export")
@@ -179,16 +227,15 @@ if file:
             x,y = result.columns[:2]
             st.bar_chart(result.set_index(x)[y])
 
-        # ================= DASHBOARD BUILDER =================
+        # ================= DASHBOARD =================
         st.subheader("Dashboard Builder")
 
-        with st.expander("Add Chart"):
-            t = st.selectbox("Type", ["Bar","Line","Scatter"])
-            x = st.selectbox("X", result.columns)
-            y = st.selectbox("Y", result.columns)
+        t = st.selectbox("Type", ["Bar","Line","Scatter"])
+        x = st.selectbox("X", result.columns)
+        y = st.selectbox("Y", result.columns)
 
-            if st.button("Add Chart"):
-                st.session_state.widgets.append({"type":t,"x":x,"y":y})
+        if st.button("Add Chart"):
+            st.session_state.widgets.append({"type":t,"x":x,"y":y})
 
         for i,w in enumerate(st.session_state.widgets):
             try:
@@ -205,9 +252,7 @@ if file:
                 st.session_state.widgets.pop(i)
                 st.rerun()
 
-        # ================= SAVE / LOAD =================
-        st.subheader("Save / Load Report")
-
+        # ================= SAVE =================
         name = st.text_input("Report Name")
 
         if st.button("Save"):
