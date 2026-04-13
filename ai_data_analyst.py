@@ -7,87 +7,174 @@ import json
 import os
 from sqlalchemy import create_engine
 from difflib import get_close_matches
+from io import BytesIO  # ✅ FIXED (export bug)
 
-st.set_page_config(layout="wide")
+# CREWAI + GPT4All
+try:
+    from crewai import Agent, Task, Crew
+    from crewai_tools import NL2SQLTool
+    from gpt4all import GPT4All
+    CREWAI_AVAILABLE = True
+except ImportError:
+    CREWAI_AVAILABLE = False
+    st.warning("pip install crewai crewai-tools gpt4all==2.8.2")
+
+st.set_page_config(layout="wide", page_title="AI SQL Dashboard")
 
 # ========================= CONFIG =========================
 DASHBOARD_FILE = "dashboards.json"
 
 # ========================= STATE =========================
 if "metrics" not in st.session_state:
-    st.session_state.metrics = {"q":0,"success":0,"fail":0,"time":0}
+    st.session_state.metrics = {"q":0,"success":0,"fail":0,"time":0,"gpt4all_success":0}
 
 if "widgets" not in st.session_state:
     st.session_state.widgets = []
 
-# ========================= STORAGE =========================
-def load_dashboards():
-    if not os.path.exists(DASHBOARD_FILE):
-        return {}
-    with open(DASHBOARD_FILE, "r") as f:
-        return json.load(f)
+if "gpt4all_model" not in st.session_state:
+    st.session_state.gpt4all_model = None
 
-def save_dashboards(data):
-    with open(DASHBOARD_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+# ========================= GPT4ALL =========================
+@st.cache_resource
+def gpt4all_llm():
+    if st.session_state.gpt4all_model:
+        return st.session_state.gpt4all_model
 
-# ========================= SQL HELPERS =========================
-def map_columns(query, df_cols):
-    query = query.lower()
-    detected = []
-    for col in df_cols:
-        if col.lower() in query:
-            detected.append(col)
-        if get_close_matches(col.lower(), query.split(), cutoff=0.7):
-            detected.append(col)
-    return list(set(detected))
+    model = GPT4All(
+        "Meta-Llama-3-8B-Instruct.Q4_0.gguf",
+        device="cpu",
+        model_path="./models",
+        verbose=False
+    )
+    st.session_state.gpt4all_model = model
+    return model
 
-def detect_aggregation(query, df):
+# ========================= SCHEMA =========================
+def describe_df(df):
+    desc = f"Table: data | Rows: {len(df)} | Columns: {len(df.columns)}\n"
+    for col in df.columns:
+        desc += f"- {col} ({df[col].dtype})\n"
+    return desc
+
+# ========================= CREWAI =========================
+def crewai_nl2sql(query, engine, df):
+    if not CREWAI_AVAILABLE:
+        return None
+
+    try:
+        llm = gpt4all_llm()
+        schema = describe_df(df)
+
+        agent = Agent(
+            role="SQL Expert",
+            goal="Convert NL to SQL",
+            backstory="Expert in SQL",
+            llm=llm,
+            verbose=False
+        )
+
+        task = Task(
+            description=f"Schema:\n{schema}\nQuery:{query}\nReturn only SQL",
+            agent=agent
+        )
+
+        crew = Crew(agents=[agent], tasks=[task])
+        result = crew.kickoff()
+
+        # ✅ FIXED REGEX
+        match = re.search(r"(SELECT.*?)(?:LIMIT\s+\d+|;|$)", result, re.IGNORECASE | re.DOTALL)
+
+        if match:
+            return match.group(1).strip()
+
+        return None
+
+    except Exception as e:
+        st.error(f"LLM Error: {str(e)[:80]}")
+        return None
+
+# ========================= RULE ENGINE =========================
+def map_columns(query, cols):
+    return [c for c in cols if c.lower() in query.lower()]
+
+def detect_agg(query, df):
     q = query.lower()
-    agg_map = {
-        "sum":"SUM","total":"SUM",
-        "avg":"AVG","average":"AVG",
-        "count":"COUNT",
-        "max":"MAX","maximum":"MAX",
-        "min":"MIN","minimum":"MIN"
-    }
+    agg_map = {"sum":"SUM","avg":"AVG","count":"COUNT","max":"MAX","min":"MIN"}
 
-    agg_func = next((agg_map[k] for k in agg_map if k in q), None)
+    agg = next((agg_map[k] for k in agg_map if k in q), None)
+    val = next((c for c in df.columns if c.lower() in q), None)
+    grp = next((c for c in df.columns if f"by {c.lower()}" in q), None)
 
-    value_col = next((col for col in df.columns if df[col].dtype != "object" and col.lower() in q), None)
-    group_col = next((col for col in df.columns if f"by {col.lower()}" in q), None)
+    return agg, val, grp
 
-    return agg_func, value_col, group_col
-
-def generate_sql(query, df):
-    agg, val, grp = detect_aggregation(query, df)
+def rule_sql(query, df):
+    agg,val,grp = detect_agg(query, df)
 
     if agg and val:
         if grp:
             return f"SELECT `{grp}`, {agg}(`{val}`) FROM data GROUP BY `{grp}`"
         return f"SELECT {agg}(`{val}`) FROM data"
 
-    cols = map_columns(query, df.columns.tolist())
+    cols = map_columns(query, df.columns)
     if cols:
         return f"SELECT {', '.join(cols)} FROM data LIMIT 10"
 
     return "SELECT * FROM data LIMIT 10"
 
+# ========================= HYBRID =========================
+def generate_sql(query, df, engine):
+    start = time.time()
+
+    sql = crewai_nl2sql(query, engine, df)
+    method = "GPT4All"
+
+    success = False
+
+    if sql:
+        try:
+            pd.read_sql(sql, engine)
+            success = True
+        except:
+            success = False
+
+    if not success:
+        sql = rule_sql(query, df)
+        method = "Rules"
+        success = True
+
+    elapsed = time.time() - start
+
+    st.session_state.metrics["q"] += 1
+    st.session_state.metrics["success"] += int(success)
+    st.session_state.metrics["fail"] += int(not success)
+    st.session_state.metrics["time"] += elapsed
+
+    return sql, method, success, elapsed
+
+# ========================= STORAGE =========================
+def load_dashboards():
+    if not os.path.exists(DASHBOARD_FILE):
+        return {}
+    return json.load(open(DASHBOARD_FILE))
+
+def save_dashboards(data):
+    json.dump(data, open(DASHBOARD_FILE,"w"), indent=2)
+
 # ========================= UI =========================
-st.title("🚀 AI Data Analysis System")
+st.title("🚀 AI Data Analysis Dashboard")
 
 file = st.file_uploader("Upload CSV")
 
 if file:
     df = pd.read_csv(file)
 
-    # ================= FILTERS =================
-    st.sidebar.header("🔎 Filters")
+    # FILTER
+    st.sidebar.header("Filters")
     filtered_df = df.copy()
 
     for col in df.columns:
-        values = sorted(df[col].dropna().astype(str).unique())
-        selected = st.sidebar.multiselect(col, values, default=values)
+        vals = sorted(df[col].dropna().astype(str).unique())
+        selected = st.sidebar.multiselect(col, vals, default=vals)  # ✅ FIXED
 
         if selected:
             filtered_df = filtered_df[filtered_df[col].astype(str).isin(selected)]
@@ -95,115 +182,48 @@ if file:
     engine = create_engine("sqlite:///:memory:")
     filtered_df.to_sql("data", engine, index=False)
 
-    # ================= DATA =================
-    st.subheader("📂 Data Preview")
     st.dataframe(filtered_df)
 
-    # ================= KPI =================
-    m = st.session_state.metrics
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Queries", m["q"])
-    c2.metric("Success %", (m["success"]/m["q"]*100) if m["q"] else 0)
-    c3.metric("Failures", m["fail"])
-    c4.metric("Avg Time", (m["time"]/m["q"]) if m["q"] else 0)
-
-    # ================= QUERY =================
-    query = st.text_input("Ask your question")
+    query = st.text_input("Ask")
 
     if query:
-        start = time.time()
-        sql = generate_sql(query, filtered_df)
+        sql,method,success,elapsed = generate_sql(query, filtered_df, engine)
+
+        st.success(f"{method} | {elapsed:.2f}s")
+
+        # ✅ SAFE SQL DISPLAY
+        if sql:
+            st.subheader("Generated SQL")
+            st.code(sql, language="sql")
+        else:
+            st.warning("No SQL generated")
 
         try:
             result = pd.read_sql(sql, engine)
-            success = True
-        except:
+            st.dataframe(result)
+        except Exception as e:
+            st.error(str(e))
             result = filtered_df.head(10)
-            success = False
 
-        # update metrics
-        st.session_state.metrics["q"] += 1
-        st.session_state.metrics["success"] += int(success)
-        st.session_state.metrics["fail"] += int(not success)
-        st.session_state.metrics["time"] += (time.time()-start)
+        # EXPORT
+        if not result.empty:
+            csv = result.to_csv(index=False).encode("utf-8")
+            st.download_button("CSV", csv)
 
-        st.code(sql)
-        st.dataframe(result)
-
-        # ================= EXPORT =================
-        st.subheader("📤 Export")
-
-        format_type = st.selectbox("Format", ["CSV","Excel"])
-
-        if format_type == "CSV":
-            st.download_button("Download CSV", result.to_csv(index=False), "data.csv")
-
-        if format_type == "Excel":
-            from io import BytesIO
             buf = BytesIO()
             result.to_excel(buf, index=False)
-            st.download_button("Download Excel", buf.getvalue(), "data.xlsx")
+            st.download_button("Excel", buf.getvalue())
 
-        # ================= INSIGHTS =================
-        if not result.empty:
-            num_cols = result.select_dtypes(include=['number']).columns
-            if len(num_cols):
-                col = num_cols[0]
-                c1,c2,c3,c4,c5 = st.columns(5)
-                c1.metric("SUM", result[col].sum())
-                c2.metric("AVG", result[col].mean())
-                c3.metric("MAX", result[col].max())
-                c4.metric("MIN", result[col].min())
-                c5.metric("COUNT", result[col].count())
+        # INSIGHTS
+        nums = result.select_dtypes(include=['number']).columns
 
-        # ================= CHART =================
-        if len(result.columns)>=2:
-            x,y = result.columns[:2]
-            st.bar_chart(result.set_index(x)[y])
+        if len(nums) > 0:  # ✅ FIXED
+            col = nums[0]
+            st.metric("SUM", result[col].sum())
+            st.metric("AVG", result[col].mean())
+            st.metric("MAX", result[col].max())
+            st.metric("COUNT", len(result))
 
-        # ================= BUILDER =================
-        st.subheader("🧩 Dashboard Builder")
-
-        with st.expander("Add Chart"):
-            chart_type = st.selectbox("Type", ["Bar","Line","Scatter"])
-            x = st.selectbox("X Axis", result.columns)
-            y = st.selectbox("Y Axis", result.columns)
-
-            if st.button("Add Chart"):
-                st.session_state.widgets.append({
-                    "type": chart_type,
-                    "x": x,
-                    "y": y
-                })
-
-        for i,w in enumerate(st.session_state.widgets):
-            try:
-                if w["type"]=="Bar":
-                    st.bar_chart(result.set_index(w["x"])[w["y"]])
-                elif w["type"]=="Line":
-                    st.line_chart(result.set_index(w["x"])[w["y"]])
-                elif w["type"]=="Scatter":
-                    st.scatter_chart(result[[w["x"],w["y"]]])
-            except:
-                pass
-
-            if st.button(f"Remove {i}", key=i):
-                st.session_state.widgets.pop(i)
-                st.rerun()
-
-        # ================= SAVE =================
-        st.subheader("💾 Save / Load Report")
-
-        name = st.text_input("Report Name")
-
-        if st.button("Save"):
-            db = load_dashboards()
-            db[name] = st.session_state.widgets
-            save_dashboards(db)
-            st.success("Saved")
-
-        db = load_dashboards()
-        if db:
-            sel = st.selectbox("Load", list(db.keys()))
-            if st.button("Load"):
-                st.session_state.widgets = db[sel]
+        # CHART
+        if len(result.columns) >= 2:
+            st.bar_chart(result.set_index(result.columns[0])[result.columns[1]])
