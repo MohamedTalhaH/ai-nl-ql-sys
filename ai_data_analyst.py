@@ -8,15 +8,6 @@ import os
 from sqlalchemy import create_engine
 from difflib import get_close_matches
 from io import BytesIO
-from reportlab.platypus import SimpleDocTemplate, Table
-from docx import Document
-
-# GROQ (SAFE IMPORT)
-try:
-    from groq import Groq
-    GROQ_AVAILABLE = True
-except:
-    GROQ_AVAILABLE = False
 
 st.set_page_config(layout="wide")
 
@@ -32,7 +23,9 @@ if "widgets" not in st.session_state:
 
 # ========================= GROQ =========================
 def groq_sql(query, df):
-    if not GROQ_AVAILABLE:
+    try:
+        from groq import Groq
+    except:
         return None
 
     api_key = os.getenv("GROQ_API_KEY")
@@ -45,8 +38,8 @@ def groq_sql(query, df):
         schema = ", ".join(df.columns)
 
         prompt = f"""
-        Convert this to SQL query.
-        Table name: data
+        Convert this natural language to SQL.
+        Table: data
         Columns: {schema}
         Only return SQL.
 
@@ -55,7 +48,7 @@ def groq_sql(query, df):
 
         res = client.chat.completions.create(
             model="llama3-70b-8192",
-            messages=[{"role":"user","content":prompt}]
+            messages=[{"role": "user", "content": prompt}]
         )
 
         text = res.choices[0].message.content
@@ -66,16 +59,29 @@ def groq_sql(query, df):
     except:
         return None
 
-# ========================= RULE ENGINE =========================
-def map_columns(query, cols):
+# ========================= STORAGE =========================
+def load_dashboards():
+    if not os.path.exists(DASHBOARD_FILE):
+        return {}
+    with open(DASHBOARD_FILE, "r") as f:
+        return json.load(f)
+
+def save_dashboards(data):
+    with open(DASHBOARD_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+# ========================= SQL HELPERS =========================
+def map_columns(query, df_cols):
     query = query.lower()
     detected = []
-    for c in cols:
-        if c.lower() in query or any(get_close_matches(c.lower(), query.split(), cutoff=0.7)):
-            detected.append(c)
+    for col in df_cols:
+        if col.lower() in query:
+            detected.append(col)
+        if get_close_matches(col.lower(), query.split(), cutoff=0.7):
+            detected.append(col)
     return list(set(detected))
 
-def detect_agg(query, df):
+def detect_aggregation(query, df):
     q = query.lower()
     agg_map = {
         "sum":"SUM","total":"SUM",
@@ -85,157 +91,150 @@ def detect_agg(query, df):
         "min":"MIN","minimum":"MIN"
     }
 
-    agg = next((agg_map[k] for k in agg_map if k in q), None)
-    val = next((c for c in df.columns if c.lower() in q), None)
-    grp = next((c for c in df.columns if f"by {c.lower()}" in q), None)
+    agg_func = next((agg_map[k] for k in agg_map if k in q), None)
 
-    return agg, val, grp
+    value_col = next((col for col in df.columns if df[col].dtype != "object" and col.lower() in q), None)
+    group_col = next((col for col in df.columns if f"by {col.lower()}" in q), None)
 
-def rule_sql(query, df):
-    agg,val,grp = detect_agg(query, df)
+    return agg_func, value_col, group_col
+
+# ========================= HYBRID SQL =========================
+def generate_sql(query, df):
+    # Try Groq AI first
+    sql = groq_sql(query, df)
+
+    if sql:
+        return sql
+
+    # Fallback rule engine
+    agg, val, grp = detect_aggregation(query, df)
 
     if agg and val:
         if grp:
             return f"SELECT `{grp}`, {agg}(`{val}`) FROM data GROUP BY `{grp}`"
         return f"SELECT {agg}(`{val}`) FROM data"
 
-    cols = map_columns(query, df.columns)
+    cols = map_columns(query, df.columns.tolist())
     if cols:
         return f"SELECT {', '.join(cols)} FROM data LIMIT 10"
 
     return "SELECT * FROM data LIMIT 10"
 
-# ========================= HYBRID =========================
-def generate_sql(query, df):
-    start = time.time()
-
-    sql = groq_sql(query, df)
-    method = "Groq AI"
-
-    if not sql:
-        sql = rule_sql(query, df)
-        method = "Rule Engine"
-
-    elapsed = time.time() - start
-
-    st.session_state.metrics["q"] += 1
-    st.session_state.metrics["time"] += elapsed
-
-    return sql, method, elapsed
-
-# ========================= STORAGE =========================
-def load_dashboards():
-    if not os.path.exists(DASHBOARD_FILE):
-        return {}
-    return json.load(open(DASHBOARD_FILE))
-
-def save_dashboards(data):
-    json.dump(data, open(DASHBOARD_FILE,"w"), indent=2)
-
 # ========================= UI =========================
-st.title("🚀 AI Data Analysis Dashboard")
+st.title("🚀 AI Data Analysis System")
+
+# DEBUG (optional)
+st.write("AI Enabled:", bool(os.getenv("GROQ_API_KEY")))
 
 file = st.file_uploader("Upload CSV")
 
 if file:
     df = pd.read_csv(file)
 
-    # ================= FILTER =================
-    st.sidebar.header("Filters")
+    # ================= FILTERS =================
+    st.sidebar.header("🔎 Filters")
     filtered_df = df.copy()
 
     for col in df.columns:
-        vals = sorted(df[col].dropna().astype(str).unique())
-        selected = st.sidebar.multiselect(col, vals, default=vals)
+        values = sorted(df[col].dropna().astype(str).unique())
+        selected = st.sidebar.multiselect(col, values, default=values)
+
         if selected:
             filtered_df = filtered_df[filtered_df[col].astype(str).isin(selected)]
 
+    if filtered_df.empty:
+        st.warning("No data after filtering")
+        st.stop()
+
     engine = create_engine("sqlite:///:memory:")
     filtered_df.to_sql("data", engine, index=False)
+
+    # ================= DATA =================
+    st.subheader("📂 Data Preview")
+    st.dataframe(filtered_df)
 
     # ================= KPI =================
     m = st.session_state.metrics
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Queries", m["q"])
-    c2.metric("Avg Time", (m["time"]/m["q"]) if m["q"] else 0)
-    c3.metric("Success", m["q"])
-    c4.metric("AI Enabled", "Yes" if GROQ_AVAILABLE else "No")
+    c2.metric("Success %", (m["success"]/m["q"]*100) if m["q"] else 0)
+    c3.metric("Failures", m["fail"])
+    c4.metric("Avg Time", (m["time"]/m["q"]) if m["q"] else 0)
 
     # ================= QUERY =================
-    query = st.text_input("Ask your query")
+    query = st.text_input("Ask your question")
 
     if query:
-        sql,method,elapsed = generate_sql(query, filtered_df)
-
-        st.success(f"{method} | {elapsed:.2f}s")
-
-        st.subheader("Generated SQL")
-        st.code(sql, language="sql")
+        start = time.time()
+        sql = generate_sql(query, filtered_df)
 
         try:
             result = pd.read_sql(sql, engine)
-            st.dataframe(result)
-        except:
+            success = True
+        except Exception as e:
+            st.error(f"SQL Error: {str(e)}")
             result = filtered_df.head(10)
-            st.error("SQL failed, showing fallback data")
+            success = False
+
+        # update metrics
+        st.session_state.metrics["q"] += 1
+        st.session_state.metrics["success"] += int(success)
+        st.session_state.metrics["fail"] += int(not success)
+        st.session_state.metrics["time"] += (time.time()-start)
+
+        # SQL DISPLAY
+        st.subheader("🧾 Generated SQL")
+        st.code(sql, language="sql")
+
+        # RESULT
+        st.subheader("📊 Result")
+        st.dataframe(result)
 
         # ================= EXPORT =================
-        st.subheader("Export")
+        if not result.empty:
+            st.subheader("📤 Export")
 
-        fmt = st.selectbox("Format", ["CSV","Excel","PDF","Word"])
+            format_type = st.selectbox("Format", ["CSV","Excel"])
 
-        if fmt == "CSV":
-            st.download_button("Download", result.to_csv(index=False), "data.csv")
+            if format_type == "CSV":
+                st.download_button("Download CSV", result.to_csv(index=False), "data.csv")
 
-        elif fmt == "Excel":
-            buf = BytesIO()
-            result.to_excel(buf, index=False)
-            st.download_button("Download", buf.getvalue(), "data.xlsx")
-
-        elif fmt == "PDF":
-            buf = BytesIO()
-            doc = SimpleDocTemplate(buf)
-            data = [result.columns.tolist()] + result.values.tolist()
-            doc.build([Table(data)])
-            st.download_button("Download", buf.getvalue(), "data.pdf")
-
-        elif fmt == "Word":
-            buf = BytesIO()
-            doc = Document()
-            table = doc.add_table(rows=len(result)+1, cols=len(result.columns))
-            for i,col in enumerate(result.columns):
-                table.rows[0].cells[i].text = col
-            for i,row in result.iterrows():
-                for j,val in enumerate(row):
-                    table.rows[i+1].cells[j].text = str(val)
-            doc.save(buf)
-            st.download_button("Download", buf.getvalue(), "data.docx")
+            if format_type == "Excel":
+                buf = BytesIO()
+                result.to_excel(buf, index=False)
+                st.download_button("Download Excel", buf.getvalue(), "data.xlsx")
 
         # ================= INSIGHTS =================
-        nums = result.select_dtypes(include=['number']).columns
-        if len(nums) > 0:
-            col = nums[0]
-            c1,c2,c3,c4,c5 = st.columns(5)
-            c1.metric("SUM", result[col].sum())
-            c2.metric("AVG", result[col].mean())
-            c3.metric("MAX", result[col].max())
-            c4.metric("MIN", result[col].min())
-            c5.metric("COUNT", len(result))
+        if not result.empty:
+            num_cols = result.select_dtypes(include=['number']).columns
+            if len(num_cols):
+                col = num_cols[0]
+                c1,c2,c3,c4,c5 = st.columns(5)
+                c1.metric("SUM", result[col].sum())
+                c2.metric("AVG", result[col].mean())
+                c3.metric("MAX", result[col].max())
+                c4.metric("MIN", result[col].min())
+                c5.metric("COUNT", result[col].count())
 
         # ================= CHART =================
-        if len(result.columns) >= 2:
+        if len(result.columns)>=2:
             x,y = result.columns[:2]
             st.bar_chart(result.set_index(x)[y])
 
-        # ================= DASHBOARD =================
-        st.subheader("Dashboard Builder")
+        # ================= BUILDER =================
+        st.subheader("🧩 Dashboard Builder")
 
-        t = st.selectbox("Type", ["Bar","Line","Scatter"])
-        x = st.selectbox("X", result.columns)
-        y = st.selectbox("Y", result.columns)
+        with st.expander("Add Chart"):
+            chart_type = st.selectbox("Type", ["Bar","Line","Scatter"])
+            x = st.selectbox("X Axis", result.columns)
+            y = st.selectbox("Y Axis", result.columns)
 
-        if st.button("Add Chart"):
-            st.session_state.widgets.append({"type":t,"x":x,"y":y})
+            if st.button("Add Chart"):
+                st.session_state.widgets.append({
+                    "type": chart_type,
+                    "x": x,
+                    "y": y
+                })
 
         for i,w in enumerate(st.session_state.widgets):
             try:
@@ -248,22 +247,24 @@ if file:
             except:
                 pass
 
-            if st.button(f"Remove {i}", key=f"r{i}"):
+            if st.button(f"Remove {i}", key=i):
                 st.session_state.widgets.pop(i)
                 st.rerun()
 
         # ================= SAVE =================
+        st.subheader("💾 Save / Load Report")
+
         name = st.text_input("Report Name")
 
         if st.button("Save"):
             db = load_dashboards()
-            db[name] = st.session_state.widgets.copy()
+            db[name] = st.session_state.widgets
             save_dashboards(db)
             st.success("Saved")
 
         db = load_dashboards()
         if db:
-            sel = st.selectbox("Load Report", list(db.keys()))
+            sel = st.selectbox("Load", list(db.keys()))
             if st.button("Load"):
                 st.session_state.widgets = db[sel]
                 st.rerun()
