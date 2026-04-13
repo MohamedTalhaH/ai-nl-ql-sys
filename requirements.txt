@@ -1,5 +1,7 @@
 streamlit
 pandas
-numpy
 sqlalchemy
+crewai
+crewai-tools
+gpt4all
 openpyxl
