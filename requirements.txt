@@ -1,7 +1,7 @@
-streamlit
-pandas
-sqlalchemy
-openpyxl
-reportlab
-python-docx
+streamlit==1.33.0
+pandas==2.2.2
+sqlalchemy==2.0.29
+openpyxl==3.1.2
+reportlab==4.0.7
+python-docx==1.1.0
 groq
