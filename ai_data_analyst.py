@@ -2,145 +2,217 @@
 import streamlit as st
 import pandas as pd
 import re
-import time
 import json
 import os
+import time
 from sqlalchemy import create_engine
 from difflib import get_close_matches
 from io import BytesIO
+import google.generativeai as genai
 
 st.set_page_config(layout="wide")
 
-# ========================= CONFIG =========================
 DASHBOARD_FILE = "dashboards.json"
 
 # ========================= STATE =========================
-if "metrics" not in st.session_state:
-    st.session_state.metrics = {"q":0,"success":0,"fail":0,"time":0}
-
 if "widgets" not in st.session_state:
     st.session_state.widgets = []
 
-# ========================= GROQ =========================
-def groq_sql(query, df):
-    try:
-        from groq import Groq
-    except:
+if "metrics" not in st.session_state:
+    st.session_state.metrics = {
+        "total": 0,
+        "success": 0,
+        "fail": 0,
+        "time": 0
+    }
+
+# ========================= GEMINI =========================
+st.sidebar.header("⚙️ AI Settings")
+gemini_key = st.sidebar.text_input("Gemini API Key", type="password")
+
+if gemini_key:
+    genai.configure(api_key=gemini_key)
+    st.sidebar.success("Gemini Connected ✅")
+else:
+    st.sidebar.warning("No API Key ❌")
+
+# ========================= GEMINI → INTENT =========================
+def gemini_to_intent(query, df):
+
+    if not gemini_key:
         return None
 
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        return None
+    models = [
+        "gemini-3.1-flash-lite-preview",  # your requested
+        "gemini-2.5-flash-latest",        # fallback
+        "gemini-1.5-flash-latest"         # safe fallback
+    ]
 
-    try:
-        client = Groq(api_key=api_key)
+    prompt = f"""
+Return ONLY valid JSON.
 
-        schema = ", ".join(df.columns)
+Columns: {df.columns.tolist()}
 
-        prompt = f"""
-        Convert this natural language to SQL.
-        Table: data
-        Columns: {schema}
-        Only return SQL.
+FORMAT:
+{{
+"agg": "sum/avg/count/max/min/none",
+"column": "column_name",
+"group_by": "column_name or none",
+"condition": "SQL condition or none",
+"limit": "number",
+"sort": "asc/desc/none"
+}}
 
-        Query: {query}
-        """
+Rules:
+- No explanation
+- Only JSON
+- Use double quotes
 
-        res = client.chat.completions.create(
-            model="llama3-70b-8192",
-            messages=[{"role": "user", "content": prompt}]
-        )
+Query: {query}
+"""
 
-        text = res.choices[0].message.content
+    for m in models:
+        try:
+            model = genai.GenerativeModel(m)
 
-        match = re.search(r"(SELECT.*)", text, re.IGNORECASE)
-        return match.group(1) if match else None
+            res = model.generate_content(prompt, generation_config={"temperature":0})
 
-    except:
-        return None
+            text = res.text.strip()
+
+            # extract JSON safely
+            match = re.search(r"\{[\s\S]*\}", text)
+            if match:
+                parsed = json.loads(match.group())
+                st.success(f"Using Model: {m} ✅")
+                return parsed
+
+        except Exception as e:
+            continue
+
+    st.warning("All Gemini models failed → fallback")
+    return None
+
+# ========================= RULE ENGINE =========================
+def safe_col(c):
+    return f"`{c}`"
+
+def match_col(name, cols):
+    matches = get_close_matches(str(name), cols, n=1)
+    return matches[0] if matches else None
+
+def build_sql(intent, df):
+
+    if not intent:
+        return "SELECT * FROM data LIMIT 10"
+
+    agg = intent.get("agg", "none")
+    col = match_col(intent.get("column"), df.columns)
+    grp = match_col(intent.get("group_by"), df.columns)
+    cond = intent.get("condition")
+    limit = intent.get("limit") or "10"
+    sort = intent.get("sort")
+
+    sql = ""
+
+    if agg != "none" and col:
+        if grp:
+            sql = f"SELECT {safe_col(grp)}, {agg.upper()}({safe_col(col)})"
+        else:
+            sql = f"SELECT {agg.upper()}({safe_col(col)})"
+    else:
+        sql = "SELECT *"
+
+    sql += " FROM data"
+
+    if cond and cond != "none":
+        sql += f" WHERE {cond}"
+
+    if grp:
+        sql += f" GROUP BY {safe_col(grp)}"
+
+    if sort != "none" and col:
+        sql += f" ORDER BY {safe_col(col)} {sort.upper()}"
+
+    sql += f" LIMIT {limit}"
+
+    return sql
 
 # ========================= STORAGE =========================
 def load_dashboards():
     if not os.path.exists(DASHBOARD_FILE):
         return {}
-    with open(DASHBOARD_FILE, "r") as f:
-        return json.load(f)
+    return json.load(open(DASHBOARD_FILE))
 
 def save_dashboards(data):
-    with open(DASHBOARD_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    json.dump(data, open(DASHBOARD_FILE,"w"), indent=2)
 
-# ========================= SQL HELPERS =========================
-def map_columns(query, df_cols):
-    query = query.lower()
-    detected = []
-    for col in df_cols:
-        if col.lower() in query:
-            detected.append(col)
-        if get_close_matches(col.lower(), query.split(), cutoff=0.7):
-            detected.append(col)
-    return list(set(detected))
+def normalize_result(result):
+    if result is None or result.empty:
+        return result
 
-def detect_aggregation(query, df):
-    q = query.lower()
-    agg_map = {
-        "sum":"SUM","total":"SUM",
-        "avg":"AVG","average":"AVG",
-        "count":"COUNT",
-        "max":"MAX","maximum":"MAX",
-        "min":"MIN","minimum":"MIN"
-    }
+    # clean column names
+    result.columns = [col.strip() for col in result.columns]
 
-    agg_func = next((agg_map[k] for k in agg_map if k in q), None)
+    # rename SQL expressions to clean names
+    new_cols = []
+    for col in result.columns:
+        if "SUM(" in col:
+            new_cols.append("sum_" + col.split("(")[-1].replace(")", ""))
+        elif "AVG(" in col:
+            new_cols.append("avg_" + col.split("(")[-1].replace(")", ""))
+        elif "COUNT(" in col:
+            new_cols.append("count")
+        elif "MAX(" in col:
+            new_cols.append("max_" + col.split("(")[-1].replace(")", ""))
+        elif "MIN(" in col:
+            new_cols.append("min_" + col.split("(")[-1].replace(")", ""))
+        else:
+            new_cols.append(col)
 
-    value_col = next((col for col in df.columns if df[col].dtype != "object" and col.lower() in q), None)
-    group_col = next((col for col in df.columns if f"by {col.lower()}" in q), None)
+    result.columns = new_cols
 
-    return agg_func, value_col, group_col
+    return result
 
-# ========================= HYBRID SQL =========================
-def generate_sql(query, df):
-    # Try Groq AI first
-    sql = groq_sql(query, df)
+def prepare_chart_data(result, x, y):
 
-    if sql:
-        return sql
+    # remove duplicate columns
+    df = result.loc[:, ~result.columns.duplicated()].copy()
 
-    # Fallback rule engine
-    agg, val, grp = detect_aggregation(query, df)
+    if x not in df.columns or y not in df.columns:
+        return None
 
-    if agg and val:
-        if grp:
-            return f"SELECT `{grp}`, {agg}(`{val}`) FROM data GROUP BY `{grp}`"
-        return f"SELECT {agg}(`{val}`) FROM data"
+    x_data = df[x]
+    y_data = df[y]
 
-    cols = map_columns(query, df.columns.tolist())
-    if cols:
-        return f"SELECT {', '.join(cols)} FROM data LIMIT 10"
+    # ensure y is 1D
+    if isinstance(y_data, pd.DataFrame):
+        y_data = y_data.iloc[:, 0]
 
-    return "SELECT * FROM data LIMIT 10"
+    # convert numeric safely
+    y_data = pd.to_numeric(y_data, errors="coerce")
 
+    df_plot = pd.DataFrame({
+        x: x_data,
+        y: y_data
+    }).dropna()
+
+    return df_plot if not df_plot.empty else None
 # ========================= UI =========================
 st.title("🚀 AI Data Analysis System")
-
-# DEBUG (optional)
-st.write("AI Enabled:", bool(os.getenv("GROQ_API_KEY")))
-
+result = st.session_state.get("last_result", None)
 file = st.file_uploader("Upload CSV")
 
 if file:
     df = pd.read_csv(file)
 
-    # ================= FILTERS =================
+    # FILTERS
     st.sidebar.header("🔎 Filters")
     filtered_df = df.copy()
 
     for col in df.columns:
-        values = sorted(df[col].dropna().astype(str).unique())
-        selected = st.sidebar.multiselect(col, values, default=values)
-
-        if selected:
-            filtered_df = filtered_df[filtered_df[col].astype(str).isin(selected)]
+        vals = df[col].astype(str).unique()
+        sel = st.sidebar.multiselect(col, vals, default=vals)
+        filtered_df = filtered_df[filtered_df[col].astype(str).isin(sel)]
 
     if filtered_df.empty:
         st.warning("No data after filtering")
@@ -149,122 +221,163 @@ if file:
     engine = create_engine("sqlite:///:memory:")
     filtered_df.to_sql("data", engine, index=False)
 
-    # ================= DATA =================
-    st.subheader("📂 Data Preview")
     st.dataframe(filtered_df)
 
-    # ================= KPI =================
-    m = st.session_state.metrics
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Queries", m["q"])
-    c2.metric("Success %", (m["success"]/m["q"]*100) if m["q"] else 0)
-    c3.metric("Failures", m["fail"])
-    c4.metric("Avg Time", (m["time"]/m["q"]) if m["q"] else 0)
-
-    # ================= QUERY =================
     query = st.text_input("Ask your question")
 
     if query:
         start = time.time()
-        sql = generate_sql(query, filtered_df)
+        st.session_state.metrics["total"] += 1
+
+        intent = gemini_to_intent(query, filtered_df)
+
+        st.subheader("🧠 Parsed Intent")
+        st.json(intent)
+
+        sql = build_sql(intent, filtered_df)
+
+        st.subheader("🧾 SQL")
+        st.code(sql)
 
         try:
             result = pd.read_sql(sql, engine)
-            success = True
-        except Exception as e:
-            st.error(f"SQL Error: {str(e)}")
+            result = normalize_result(result)
+
+# ✅ store CLEAN result
+            st.session_state["last_result"] = result
+            st.session_state.metrics["success"] += 1
+        except:
             result = filtered_df.head(10)
-            success = False
+            st.session_state.metrics["fail"] += 1
 
-        # update metrics
-        st.session_state.metrics["q"] += 1
-        st.session_state.metrics["success"] += int(success)
-        st.session_state.metrics["fail"] += int(not success)
-        st.session_state.metrics["time"] += (time.time()-start)
+        st.session_state.metrics["time"] += (time.time() - start)
 
-        # SQL DISPLAY
-        st.subheader("🧾 Generated SQL")
-        st.code(sql, language="sql")
-
-        # RESULT
         st.subheader("📊 Result")
         st.dataframe(result)
+        
+        # ================= INSIGHTS =================
+        st.subheader("📈 Insights")
+
+        num_cols = result.select_dtypes(include=['number']).columns.tolist()
+
+        if len(num_cols):
+            col = num_cols[0]
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("SUM", result[col].sum())
+            c2.metric("AVG", result[col].mean())
+            c3.metric("MAX", result[col].max())
+            c4.metric("MIN", result[col].min())
+            c5.metric("COUNT", result[col].count())
+            
+        # ================= PERFORMANCE =================
+        st.subheader("📊 Query Performance")
+
+        m = st.session_state.metrics
+        total = m["total"]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Queries", total)
+        c2.metric("Success", m["success"])
+        c3.metric("Failed", m["fail"])
+        c4.metric("Avg Time (s)", round(m["time"]/max(total,1), 3))
 
         # ================= EXPORT =================
-        if not result.empty:
-            st.subheader("📤 Export")
+        st.subheader("📤 Export")
 
-            format_type = st.selectbox("Format", ["CSV","Excel"])
+        fmt = st.selectbox("Format", ["CSV", "Excel"])
 
-            if format_type == "CSV":
-                st.download_button("Download CSV", result.to_csv(index=False), "data.csv")
+        if fmt == "CSV":
+            st.download_button("Download CSV", result.to_csv(index=False), "data.csv")
 
-            if format_type == "Excel":
-                buf = BytesIO()
-                result.to_excel(buf, index=False)
-                st.download_button("Download Excel", buf.getvalue(), "data.xlsx")
+        elif fmt == "Excel":
+            buf = BytesIO()
+            result.to_excel(buf, index=False)
+            st.download_button("Download Excel", buf.getvalue(), "data.xlsx")
 
-        # ================= INSIGHTS =================
-        if not result.empty:
-            num_cols = result.select_dtypes(include=['number']).columns
-            if len(num_cols):
-                col = num_cols[0]
-                c1,c2,c3,c4,c5 = st.columns(5)
-                c1.metric("SUM", result[col].sum())
-                c2.metric("AVG", result[col].mean())
-                c3.metric("MAX", result[col].max())
-                c4.metric("MIN", result[col].min())
-                c5.metric("COUNT", result[col].count())
+if "last_result" in st.session_state:
+    result = st.session_state["last_result"]
+else:
+    result = None
+# ================= CHART BUILDER =================
+st.subheader("📊 Chart Builder")
 
-        # ================= CHART =================
-        if len(result.columns)>=2:
-            x,y = result.columns[:2]
-            st.bar_chart(result.set_index(x)[y])
+result = st.session_state.get("last_result", None)
 
-        # ================= BUILDER =================
-        st.subheader("🧩 Dashboard Builder")
+if result is not None and len(result.columns) >= 2:
 
-        with st.expander("Add Chart"):
-            chart_type = st.selectbox("Type", ["Bar","Line","Scatter"])
-            x = st.selectbox("X Axis", result.columns)
-            y = st.selectbox("Y Axis", result.columns)
+    cols = list(result.columns)
 
-            if st.button("Add Chart"):
-                st.session_state.widgets.append({
-                    "type": chart_type,
-                    "x": x,
-                    "y": y
-                })
+    chart_type = st.selectbox("Chart Type", ["Bar", "Line", "Scatter"])
 
-        for i,w in enumerate(st.session_state.widgets):
-            try:
-                if w["type"]=="Bar":
-                    st.bar_chart(result.set_index(w["x"])[w["y"]])
-                elif w["type"]=="Line":
-                    st.line_chart(result.set_index(w["x"])[w["y"]])
-                elif w["type"]=="Scatter":
-                    st.scatter_chart(result[[w["x"],w["y"]]])
-            except:
-                pass
+    x = st.selectbox("X Axis", cols)
+    y = st.selectbox("Y Axis", cols)
 
-            if st.button(f"Remove {i}", key=i):
-                st.session_state.widgets.pop(i)
-                st.rerun()
+    if x == y:
+        st.warning("X and Y cannot be same")
 
-        # ================= SAVE =================
-        st.subheader("💾 Save / Load Report")
+    elif x in cols and y in cols:
 
-        name = st.text_input("Report Name")
+        try:
+            if chart_type == "Bar":
+                st.bar_chart(result.set_index(x)[y])
+            elif chart_type == "Line":
+                st.line_chart(result.set_index(x)[y])
+            elif chart_type == "Scatter":
+                st.scatter_chart(result[[x, y]])
 
-        if st.button("Save"):
-            db = load_dashboards()
-            db[name] = st.session_state.widgets
-            save_dashboards(db)
-            st.success("Saved")
+        except Exception as e:
+            st.error(f"Chart failed: {e}")
 
-        db = load_dashboards()
-        if db:
-            sel = st.selectbox("Load", list(db.keys()))
-            if st.button("Load"):
-                st.session_state.widgets = db[sel]
-                st.rerun()
+    if st.button("Add Chart"):
+        st.session_state.widgets.append({
+            "x": x,
+            "y": y,
+            "type": chart_type
+        })
+# ================= DASHBOARD =================
+st.subheader("🧩 Dashboard")
+
+result = st.session_state.get("last_result", None)
+
+if result is not None and st.session_state.widgets:
+
+    for i, w in enumerate(st.session_state.widgets):
+
+        try:
+            if w["type"] == "Bar":
+                st.bar_chart(result.set_index(w["x"])[w["y"]])
+            elif w["type"] == "Line":
+                st.line_chart(result.set_index(w["x"])[w["y"]])
+            elif w["type"] == "Scatter":
+                st.scatter_chart(result[[w["x"], w["y"]]])
+
+        except Exception:
+            st.warning(f"Chart {i} failed")
+
+        if st.button(f"Remove {i}", key=f"remove_{i}"):
+            st.session_state.widgets.pop(i)
+            st.rerun()
+# ================= SAVE =================
+st.subheader("💾 Save Report")
+
+name = st.text_input("Report Name")
+
+if st.button("Save"):
+    db = load_dashboards()
+    db[name] = st.session_state.widgets
+    save_dashboards(db)
+    st.success("Saved")
+
+# ================= LOAD =================
+st.subheader("📂 Load Report")
+
+db = load_dashboards()
+
+if db:
+    selected = st.selectbox("Select Report", list(db.keys()))
+
+    if st.button("Load"):
+        st.session_state.widgets = db[selected]
+        st.success(f"Loaded: {selected}")
+        st.rerun()
+
