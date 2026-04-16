@@ -2,6 +2,7 @@ streamlit==1.33.0
 pandas==2.2.2
 sqlalchemy==2.0.29
 openpyxl==3.1.2
-reportlab==4.0.7
-python-docx==1.1.0
-groq
+google-generativeai==0.7.2
+requests==2.31.0
+urllib3==1.26.18
+charset_normalizer==3.3.2
