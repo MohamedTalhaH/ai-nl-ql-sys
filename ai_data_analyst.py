@@ -13,18 +13,41 @@ import google.generativeai as genai
 st.set_page_config(layout="wide")
 
 DASHBOARD_FILE = "dashboards.json"
+MAX_WIDGETS = 10
+METRICS_RESET_THRESHOLD = 100
 
-# ========================= STATE =========================
-if "widgets" not in st.session_state:
-    st.session_state.widgets = []
+# ========================= SESSION CLEANUP =========================
+def init_session_state():
+    """Initialize session state with proper defaults and clean up stale data."""
+    if "widgets" not in st.session_state:
+        st.session_state.widgets = []
 
-if "metrics" not in st.session_state:
-    st.session_state.metrics = {
-        "total": 0,
-        "success": 0,
-        "fail": 0,
-        "time": 0
-    }
+    if "metrics" not in st.session_state:
+        st.session_state.metrics = {
+            "total": 0,
+            "success": 0,
+            "fail": 0,
+            "time": 0
+        }
+
+    if "last_result" not in st.session_state:
+        st.session_state.last_result = None
+
+    # Trim widgets list if it somehow exceeded the cap (e.g. loaded from a saved report)
+    if len(st.session_state.widgets) > MAX_WIDGETS:
+        st.session_state.widgets = st.session_state.widgets[-MAX_WIDGETS:]
+
+    # Periodically reset metrics to prevent unbounded accumulation
+    if st.session_state.metrics.get("total", 0) >= METRICS_RESET_THRESHOLD:
+        st.session_state.metrics = {
+            "total": 0,
+            "success": 0,
+            "fail": 0,
+            "time": 0
+        }
+
+init_session_state()
+
 
 # ========================= GEMINI =========================
 st.sidebar.header("⚙️ AI Settings")
@@ -197,7 +220,14 @@ def prepare_chart_data(result, x, y):
     }).dropna()
 
     return df_plot if not df_plot.empty else None
+# ========================= ENGINE =========================
+@st.cache_resource
+def get_engine():
+    """Return a single cached SQLAlchemy in-memory engine for the session."""
+    return create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+
 # ========================= UI =========================
+
 st.title("🚀 AI Data Analysis System")
 result = st.session_state.get("last_result", None)
 file = st.file_uploader("Upload CSV")
@@ -218,81 +248,93 @@ if file:
         st.warning("No data after filtering")
         st.stop()
 
-    engine = create_engine("sqlite:///:memory:")
-    filtered_df.to_sql("data", engine, index=False)
+    engine = get_engine()
+    filtered_df.to_sql("data", engine, index=False, if_exists="replace")
+
 
     st.dataframe(filtered_df)
 
     query = st.text_input("Ask your question")
 
     if query:
-        start = time.time()
-        st.session_state.metrics["total"] += 1
-
-        intent = gemini_to_intent(query, filtered_df)
-
-        st.subheader("🧠 Parsed Intent")
-        st.json(intent)
-
-        sql = build_sql(intent, filtered_df)
-
-        st.subheader("🧾 SQL")
-        st.code(sql)
-
         try:
-            result = pd.read_sql(sql, engine)
-            result = normalize_result(result)
+            start = time.time()
+            st.session_state.metrics["total"] += 1
 
-# ✅ store CLEAN result
-            st.session_state["last_result"] = result
-            st.session_state.metrics["success"] += 1
-        except:
-            result = filtered_df.head(10)
+            # Gemini API call wrapped to prevent partial state corruption
+            try:
+                intent = gemini_to_intent(query, filtered_df)
+            except Exception as gemini_err:
+                st.warning(f"Gemini API error: {gemini_err} — falling back to rule engine")
+                intent = None
+
+            st.subheader("🧠 Parsed Intent")
+            st.json(intent)
+
+            sql = build_sql(intent, filtered_df)
+
+            st.subheader("🧾 SQL")
+            st.code(sql)
+
+            try:
+                result = pd.read_sql(sql, engine)
+                result = normalize_result(result)
+                # ✅ store CLEAN result
+                st.session_state["last_result"] = result
+                st.session_state.metrics["success"] += 1
+            except Exception as sql_err:
+                st.warning(f"SQL execution failed ({sql_err}), showing raw data")
+                result = filtered_df.head(10)
+                st.session_state.metrics["fail"] += 1
+
+            st.session_state.metrics["time"] += (time.time() - start)
+
+            st.subheader("📊 Result")
+            st.dataframe(result)
+
+            # ================= INSIGHTS =================
+            st.subheader("📈 Insights")
+
+            num_cols = result.select_dtypes(include=['number']).columns.tolist()
+
+            if len(num_cols):
+                col = num_cols[0]
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("SUM", result[col].sum())
+                c2.metric("AVG", result[col].mean())
+                c3.metric("MAX", result[col].max())
+                c4.metric("MIN", result[col].min())
+                c5.metric("COUNT", result[col].count())
+
+            # ================= PERFORMANCE =================
+            st.subheader("📊 Query Performance")
+
+            m = st.session_state.metrics
+            total = m["total"]
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total Queries", total)
+            c2.metric("Success", m["success"])
+            c3.metric("Failed", m["fail"])
+            c4.metric("Avg Time (s)", round(m["time"] / max(total, 1), 3))
+
+            # ================= EXPORT =================
+            st.subheader("📤 Export")
+
+            fmt = st.selectbox("Format", ["CSV", "Excel"])
+
+            if fmt == "CSV":
+                st.download_button("Download CSV", result.to_csv(index=False), "data.csv")
+
+            elif fmt == "Excel":
+                buf = BytesIO()
+                result.to_excel(buf, index=False)
+                st.download_button("Download Excel", buf.getvalue(), "data.xlsx")
+
+        except Exception as e:
+            st.error(f"Unexpected error processing query: {e}")
             st.session_state.metrics["fail"] += 1
 
-        st.session_state.metrics["time"] += (time.time() - start)
-
-        st.subheader("📊 Result")
-        st.dataframe(result)
-        
-        # ================= INSIGHTS =================
-        st.subheader("📈 Insights")
-
-        num_cols = result.select_dtypes(include=['number']).columns.tolist()
-
-        if len(num_cols):
-            col = num_cols[0]
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("SUM", result[col].sum())
-            c2.metric("AVG", result[col].mean())
-            c3.metric("MAX", result[col].max())
-            c4.metric("MIN", result[col].min())
-            c5.metric("COUNT", result[col].count())
-            
-        # ================= PERFORMANCE =================
-        st.subheader("📊 Query Performance")
-
-        m = st.session_state.metrics
-        total = m["total"]
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Queries", total)
-        c2.metric("Success", m["success"])
-        c3.metric("Failed", m["fail"])
-        c4.metric("Avg Time (s)", round(m["time"]/max(total,1), 3))
-
-        # ================= EXPORT =================
-        st.subheader("📤 Export")
-
-        fmt = st.selectbox("Format", ["CSV", "Excel"])
-
-        if fmt == "CSV":
-            st.download_button("Download CSV", result.to_csv(index=False), "data.csv")
-
-        elif fmt == "Excel":
-            buf = BytesIO()
-            result.to_excel(buf, index=False)
-            st.download_button("Download Excel", buf.getvalue(), "data.xlsx")
 
 if "last_result" in st.session_state:
     result = st.session_state["last_result"]
@@ -329,12 +371,15 @@ if result is not None and len(result.columns) >= 2:
             st.error(f"Chart failed: {e}")
 
     if st.button("Add Chart"):
-        st.session_state.widgets.append({
-            "x": x,
-            "y": y,
-            "type": chart_type
-        })
-# ================= DASHBOARD =================
+        if len(st.session_state.widgets) >= MAX_WIDGETS:
+            st.warning(f"Dashboard limit reached ({MAX_WIDGETS} charts max). Remove a chart before adding a new one.")
+        else:
+            st.session_state.widgets.append({
+                "x": x,
+                "y": y,
+                "type": chart_type
+            })
+
 st.subheader("🧩 Dashboard")
 
 result = st.session_state.get("last_result", None)
