@@ -10,6 +10,7 @@ from difflib import get_close_matches
 from io import BytesIO
 import google.generativeai as genai
 
+# ========================= PAGE CONFIG =========================
 st.set_page_config(layout="wide")
 
 DASHBOARD_FILE = "dashboards.json"
@@ -47,7 +48,12 @@ def safe_col(c):
 def clean_value(v):
 
     if isinstance(v, str):
-        return v.strip().strip("'").strip('"')
+
+        return (
+            v.strip()
+            .strip("'")
+            .strip('"')
+        )
 
     return v
 
@@ -100,7 +106,7 @@ def clean_dataframe(df):
 
     return cleaned
 
-# ========================= GEMINI → INTENT =========================
+# ========================= GEMINI TO INTENT =========================
 def gemini_to_intent(query, df):
 
     if not gemini_key:
@@ -118,12 +124,12 @@ Return ONLY valid JSON.
 Dataset Columns:
 {df.columns.tolist()}
 
-JSON FORMAT:
+FORMAT:
 {{
     "agg":"sum/avg/count/max/min/none",
     "column":"column name",
     "group_by":"column name or none",
-    "condition":"SQL style condition or none",
+    "condition":"SQL condition or none",
     "limit":"number",
     "sort":"asc/desc/none"
 }}
@@ -132,9 +138,9 @@ Rules:
 - ONLY JSON
 - NO explanation
 - Use exact dataset columns
-- If no aggregate -> "none"
-- If no group_by -> "none"
-- If no condition -> "none"
+- If no aggregate use "none"
+- If no group_by use "none"
+- If no condition use "none"
 
 User Query:
 {query}
@@ -174,37 +180,89 @@ User Query:
             continue
 
     st.warning("Gemini Parsing Failed")
+
     return None
 
-# ========================= CONDITION PARSER =========================
+# ========================= ADVANCED WHERE PARSER =========================
 def build_where_clause(condition, df):
 
     if not condition:
         return ""
 
-    if str(condition).lower() == "none":
-        return ""
+    condition = str(condition).strip()
 
-    operators = [
-        "<=",
-        ">=",
-        "!=",
-        "=",
-        "<",
-        ">"
-    ]
-
-    found_op = None
-
-    for op in operators:
-        if op in condition:
-            found_op = op
-            break
-
-    if not found_op:
+    if condition.lower() == "none":
         return ""
 
     try:
+
+        # ================= BETWEEN SUPPORT =================
+        between_match = re.search(
+            r"(.+?)\s+between\s+(.+?)\s+and\s+(.+)",
+            condition,
+            re.IGNORECASE
+        )
+
+        if between_match:
+
+            col_name = between_match.group(1).strip()
+
+            val1 = between_match.group(2).strip()
+
+            val2 = between_match.group(3).strip()
+
+            matched_col = match_col(
+                col_name,
+                df.columns
+            )
+
+            if matched_col:
+
+                dtype = str(
+                    df[matched_col].dtype
+                )
+
+                # numeric range
+                if (
+                    "int" in dtype
+                    or "float" in dtype
+                ):
+
+                    return f"""
+                    WHERE {safe_col(matched_col)}
+                    BETWEEN {float(val1)}
+                    AND {float(val2)}
+                    """
+
+                # string/date range
+                else:
+
+                    return f"""
+                    WHERE LOWER(TRIM({safe_col(matched_col)}))
+                    BETWEEN LOWER(TRIM('{val1}'))
+                    AND LOWER(TRIM('{val2}'))
+                    """
+
+        # ================= NORMAL OPERATORS =================
+        operators = [
+            "<=",
+            ">=",
+            "!=",
+            "=",
+            "<",
+            ">"
+        ]
+
+        found_op = None
+
+        for op in operators:
+
+            if op in condition:
+                found_op = op
+                break
+
+        if not found_op:
+            return ""
 
         left, right = condition.split(
             found_op,
@@ -212,6 +270,7 @@ def build_where_clause(condition, df):
         )
 
         left = clean_value(left)
+
         right = clean_value(right)
 
         matched_col = match_col(
@@ -224,7 +283,7 @@ def build_where_clause(condition, df):
 
         dtype = str(df[matched_col].dtype)
 
-        # STRING COLUMN
+        # ================= STRING =================
         if (
             "object" in dtype
             or "str" in dtype
@@ -236,23 +295,21 @@ def build_where_clause(condition, df):
             LOWER(TRIM('{right}'))
             """
 
-        # NUMERIC COLUMN
+        # ================= NUMERIC =================
         else:
 
-            try:
+            return f"""
+            WHERE {safe_col(matched_col)}
+            {found_op}
+            {float(right)}
+            """
 
-                num = float(right)
+    except Exception as e:
 
-                return f"""
-                WHERE {safe_col(matched_col)}
-                {found_op}
-                {num}
-                """
+        st.warning(
+            f"Condition parse failed: {e}"
+        )
 
-            except:
-                return ""
-
-    except:
         return ""
 
 # ========================= SQL BUILDER =========================
@@ -280,15 +337,27 @@ def build_sql(intent, df):
         "none"
     )
 
-    limit = intent.get("limit", 10)
+    limit = intent.get(
+        "limit",
+        10
+    )
 
     sort = str(
         intent.get("sort", "none")
     ).lower()
 
-    sql = ""
+    try:
+        limit = int(limit)
+    except:
+        limit = 10
 
-    # ================= SELECT =================
+    # ================= WHERE =================
+    where_clause = build_where_clause(
+        cond,
+        df
+    )
+
+    # ================= AGGREGATE QUERY =================
     if agg != "none" and col:
 
         agg_map = {
@@ -299,73 +368,75 @@ def build_sql(intent, df):
             "min": "MIN"
         }
 
-        agg_sql = agg_map.get(agg, "SUM")
+        agg_sql = agg_map.get(
+            agg,
+            "SUM"
+        )
 
+        # ================= GROUP BY =================
         if grp and grp != "none":
 
             sql = f"""
             SELECT
                 {safe_col(grp)},
                 {agg_sql}({safe_col(col)}) AS value
-            FROM data
+            FROM
+            (
+                SELECT *
+                FROM data
+                {where_clause}
+                LIMIT {limit}
+            )
+            GROUP BY {safe_col(grp)}
             """
 
+        # ================= NORMAL AGG =================
         else:
 
             sql = f"""
             SELECT
                 {agg_sql}({safe_col(col)}) AS value
-            FROM data
+            FROM
+            (
+                SELECT *
+                FROM data
+                {where_clause}
+                LIMIT {limit}
+            )
             """
 
+    # ================= NORMAL SELECT =================
     else:
 
-        sql = "SELECT * FROM data"
-
-    # ================= WHERE =================
-    where_clause = build_where_clause(
-        cond,
-        df
-    )
-
-    sql += f" {where_clause}"
-
-    # ================= GROUP BY =================
-    if grp and grp != "none":
-
-        sql += f"""
-        GROUP BY {safe_col(grp)}
+        sql = f"""
+        SELECT *
+        FROM data
+        {where_clause}
         """
 
-    # ================= ORDER BY =================
-    if sort in ["asc", "desc"]:
-
-        order_col = grp if grp else col
-
-        if order_col:
+        # ORDER BY
+        if sort in ["asc", "desc"] and col:
 
             sql += f"""
-            ORDER BY {safe_col(order_col)}
+            ORDER BY {safe_col(col)}
             {sort.upper()}
             """
 
-    # ================= LIMIT =================
-    try:
-        limit = int(limit)
-    except:
-        limit = 10
-
-    sql += f" LIMIT {limit}"
+        sql += f" LIMIT {limit}"
 
     return sql
 
 # ========================= STORAGE =========================
 def load_dashboards():
 
-    if not os.path.exists(DASHBOARD_FILE):
+    if not os.path.exists(
+        DASHBOARD_FILE
+    ):
         return {}
 
-    return json.load(open(DASHBOARD_FILE))
+    return json.load(
+        open(DASHBOARD_FILE)
+    )
 
 def save_dashboards(data):
 
@@ -388,33 +459,52 @@ def normalize_result(result):
 
     return result
 
-# ========================= CHART PREP =========================
+# ========================= CHART DATA =========================
 def prepare_chart_data(result, x, y):
 
+    if result is None or result.empty:
+        return None
+
+    # remove duplicate columns
     df = result.loc[
         :,
         ~result.columns.duplicated()
     ].copy()
 
-    if x not in df.columns or y not in df.columns:
+    # validate columns
+    if x not in df.columns:
         return None
 
-    y_data = pd.to_numeric(
-        df[y],
-        errors="coerce"
-    )
+    if y not in df.columns:
+        return None
 
-    plot_df = pd.DataFrame({
-        x: df[x],
-        y: y_data
-    }).dropna()
+    try:
 
-    return plot_df if not plot_df.empty else None
+        # convert y safely
+        df[y] = pd.to_numeric(
+            df[y],
+            errors="coerce"
+        )
 
-# ========================= UI =========================
+        # remove nulls
+        df = df.dropna(
+            subset=[x, y]
+        )
+
+        if df.empty:
+            return None
+
+        return df[[x, y]]
+
+    except:
+        return None
+
+# ========================= MAIN UI =========================
 st.title("🚀 AI Data Analysis System")
 
-file = st.file_uploader("Upload CSV")
+file = st.file_uploader(
+    "Upload CSV"
+)
 
 if file:
 
@@ -422,7 +512,7 @@ if file:
 
         df = pd.read_csv(file)
 
-        # CLEAN DATA
+        # clean dataframe
         df = clean_dataframe(df)
 
     except Exception as e:
@@ -458,7 +548,9 @@ if file:
 
     if filtered_df.empty:
 
-        st.warning("No data after filtering")
+        st.warning(
+            "No data after filtering"
+        )
 
         st.stop()
 
@@ -551,7 +643,9 @@ if file:
 
         st.session_state.metrics[
             "time"
-        ] += (time.time() - start)
+        ] += (
+            time.time() - start
+        )
 
         # ================= RESULT =================
         st.subheader("📊 Result")
@@ -697,9 +791,14 @@ if (
     and not result.empty
 ):
 
-    if len(result.columns) >= 2:
+    cols = list(result.columns)
 
-        cols = list(result.columns)
+    # numeric columns only for y
+    numeric_cols = result.select_dtypes(
+        include=["number"]
+    ).columns.tolist()
+
+    if len(cols) >= 1 and len(numeric_cols) >= 1:
 
         chart_type = st.selectbox(
             "Chart Type",
@@ -713,46 +812,36 @@ if (
 
         y = st.selectbox(
             "Y Axis",
-            cols
+            numeric_cols
         )
 
-        if x == y:
+        plot_df = prepare_chart_data(
+            result,
+            x,
+            y
+        )
 
-            st.warning(
-                "X and Y cannot be same"
-            )
-
-        else:
+        if plot_df is not None:
 
             try:
 
-                plot_df = prepare_chart_data(
-                    result,
-                    x,
-                    y
-                )
+                if chart_type == "Bar":
 
-                if plot_df is not None:
+                    st.bar_chart(
+                        plot_df.set_index(x)[y]
+                    )
 
-                    if chart_type == "Bar":
+                elif chart_type == "Line":
 
-                        st.bar_chart(
-                            plot_df
-                            .set_index(x)[y]
-                        )
+                    st.line_chart(
+                        plot_df.set_index(x)[y]
+                    )
 
-                    elif chart_type == "Line":
+                elif chart_type == "Scatter":
 
-                        st.line_chart(
-                            plot_df
-                            .set_index(x)[y]
-                        )
-
-                    elif chart_type == "Scatter":
-
-                        st.scatter_chart(
-                            plot_df[[x, y]]
-                        )
+                    st.scatter_chart(
+                        plot_df[[x, y]]
+                    )
 
             except Exception as e:
 
@@ -760,7 +849,13 @@ if (
                     f"Chart failed: {e}"
                 )
 
-        # ================= ADD CHART =================
+        else:
+
+            st.warning(
+                "Invalid chart data"
+            )
+
+        # ================= SAVE CHART =================
         if st.button("Add Chart"):
 
             st.session_state.widgets.append({
@@ -768,6 +863,8 @@ if (
                 "y": y,
                 "type": chart_type
             })
+
+            st.success("Chart Added")
 
 # ========================= DASHBOARD =========================
 st.subheader("🧩 Dashboard")
@@ -778,46 +875,68 @@ if (
     and st.session_state.widgets
 ):
 
+    remove_idx = None
+
     for i, w in enumerate(
         st.session_state.widgets
     ):
 
-        try:
+        st.markdown(f"### Chart {i+1}")
 
-            plot_df = prepare_chart_data(
-                result,
-                w["x"],
-                w["y"]
+        x = w.get("x")
+        y = w.get("y")
+        chart_type = w.get("type")
+
+        # validate columns
+        if (
+            x not in result.columns
+            or y not in result.columns
+        ):
+
+            st.warning(
+                f"Chart {i+1} skipped: columns not found"
             )
 
-            if plot_df is not None:
+            continue
 
-                if w["type"] == "Bar":
+        plot_df = prepare_chart_data(
+            result,
+            x,
+            y
+        )
 
-                    st.bar_chart(
-                        plot_df
-                        .set_index(w["x"])[w["y"]]
-                    )
+        if plot_df is None:
 
-                elif w["type"] == "Line":
+            st.warning(
+                f"Chart {i+1} has invalid data"
+            )
 
-                    st.line_chart(
-                        plot_df
-                        .set_index(w["x"])[w["y"]]
-                    )
+            continue
 
-                elif w["type"] == "Scatter":
+        try:
 
-                    st.scatter_chart(
-                        plot_df[
-                            [w["x"], w["y"]]
-                        ]
-                    )
+            if chart_type == "Bar":
+
+                st.bar_chart(
+                    plot_df.set_index(x)[y]
+                )
+
+            elif chart_type == "Line":
+
+                st.line_chart(
+                    plot_df.set_index(x)[y]
+                )
+
+            elif chart_type == "Scatter":
+
+                st.scatter_chart(
+                    plot_df[[x, y]]
+                )
 
         except Exception as e:
 
             st.warning(
-                f"Chart {i} failed: {e}"
+                f"Chart {i+1} failed: {e}"
             )
 
         if st.button(
@@ -825,9 +944,16 @@ if (
             key=f"remove_{i}"
         ):
 
-            st.session_state.widgets.pop(i)
+            remove_idx = i
 
-            st.rerun()
+    # remove safely
+    if remove_idx is not None:
+
+        st.session_state.widgets.pop(
+            remove_idx
+        )
+
+        st.rerun()
 
 # ========================= SAVE REPORT =========================
 st.subheader("💾 Save Report")
